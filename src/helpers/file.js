@@ -1,50 +1,175 @@
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+import colors from "colors";
+import fileHelper from "../helpers/file.js";
+import tokenHelper from "../helpers/token.js";
 
-class FileHelper {
+class AuthService {
   constructor() {}
 
-  readFile(fileName) {
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = path.dirname(__filename);
-
-    const filePath = path.join(__dirname, "..", "data", fileName);
-
-    const data = fs.readFileSync(filePath, "utf8");
-    return data;
+  async login(user, skipLog = false) {
+    user.http.updateToken(null);
+    user.http.updateRefreshToken(null);
+    const body = {
+      query: user.query_id,
+      referralToken: user?.database?.ref,
+    };
+    try {
+      const { data } = await user.http.post(
+        3,
+        "auth/provider/PROVIDER_TELEGRAM_MINI_APP",
+        body
+      );
+      if (data?.token) {
+        return {
+          access: data?.token?.access,
+          refresh: data?.token?.refresh,
+        };
+      }
+      return null;
+    } catch (error) {
+      if (!skipLog) {
+        user.log.logError(
+          `Login failed: ${error.response?.data?.message}`
+        );
+      }
+      return null;
+    }
   }
 
-  writeFile(fileName, data) {
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = path.dirname(__filename);
-
-    const filePath = path.join(__dirname, "..", "data", fileName);
-
-    fs.writeFileSync(filePath, data);
+  async refresh(user, refreshToken, skipLog = false) {
+    user.http.updateToken(null);
+    user.http.updateRefreshToken(null);
+    const body = {
+      refresh: refreshToken,
+    };
+    try {
+      const { data } = await user.http.post(1, "auth/refresh", body);
+      if (data?.access) {
+        return {
+          access: data.access,
+          refresh: data.refresh,
+        };
+      }
+      return null;
+    } catch (error) {
+      if (!skipLog) {
+        user.log.logError(
+          `Refresh token failed: ${error.response?.data?.message}`
+        );
+      }
+      return null;
+    }
   }
 
-  writeLog(fileName, data) {
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = path.dirname(__filename);
+  async handleLogin(user) {
+    console.log(
+      `============== Running account ${user.index} | ${user.info.fullName.green} ==============`
+    );
 
-    const filePath = path.join(__dirname, "..", "data", fileName);
+    let info = null;
+    let token = fileHelper.getTokenById(user.info.id);
 
-    fs.appendFileSync(filePath, data + "\n");
+    if (token && !tokenHelper.isExpired(token.access)) {
+      const info = {
+        access: token.access,
+        refresh: token.refresh,
+      };
+      const profile = await this.handleAfterLogin(user, info);
+      return {
+        status: 1,
+        profile,
+      };
+    }
+
+    let infoLogin = await this.login(user);
+
+    if (infoLogin) {
+      const profile = await this.handleAfterLogin(user, infoLogin);
+      return {
+        status: 1,
+        profile,
+      };
+    }
+    user.log.logError(
+      "Login process failed, please check your account information (you may need to retrieve a new query_id). The system will attempt to log in again after 60s"
+    );
+    return {
+      status: 0,
+      profile: null,
+    };
   }
 
-  getTokenById(userId) {
-    const tokens = JSON.parse(this.readFile("token.json"));
-    return tokens[userId] || null;
+  async getProfile(user) {
+    try {
+      const { data } = await user.http.get(0, "user/balance");
+      if (data) {
+        return data;
+      }
+      return null;
+    } catch (error) {
+      user.log.logError(
+        `Failed to retrieve account information: ${error.response?.data?.message}`
+      );
+      return null;
+    }
   }
 
-  saveToken(userId, token) {
-    const tokens = JSON.parse(this.readFile("token.json"));
-    tokens[userId] = token;
-    const data = JSON.stringify(tokens, null, 4);
-    this.writeFile("token.json", data);
+  async reconnect(user) {
+    let info = null;
+    let token = fileHelper.getTokenById(user.info.id);
+
+    if (
+      token &&
+      tokenHelper.isExpired(token.access) &&
+      !tokenHelper.isExpired(token.refresh)
+    ) {
+      info = await this.refresh(user, token.refresh, true);
+      if (info) {
+        await this.handleAfterReconnect(user, info);
+        return 1;
+      }
+    }
+
+    let infoLogin = await this.login(user, true);
+
+    if (infoLogin) {
+      await this.handleAfterReconnect(user, infoLogin);
+      return 1;
+    }
+    return 0;
+  }
+
+  async handleAfterLogin(user, info) {
+    const accessToken = info.access || null;
+    const refreshToken = info.refresh || null;
+    user.http.updateToken(accessToken);
+    user.http.updateRefreshToken(refreshToken);
+    fileHelper.saveToken(user.info.id, info);
+    const profile = await this.getProfile(user);
+    if (profile) {
+      user.log.log(
+        colors.green("Login successful: ") +
+          `Points: ${
+            colors.green(Math.round(profile?.availableBalance)) + user.currency
+          }`
+      );
+      if (!user.http.isConnected) {
+        user.http.updateConnect(true);
+        setInterval(async () => {
+          await this.reconnect(user);
+        }, 60 * 1000 * 20);
+      }
+    }
+    return profile;
+  }
+
+  async handleAfterReconnect(user, info) {
+    const accessToken = info.access || null;
+    const refreshToken = info.refresh || null;
+    user.http.updateToken(accessToken);
+    user.http.updateRefreshToken(refreshToken);
+    fileHelper.saveToken(user.info.id, info);
   }
 }
 
-const fileHelper = new FileHelper();
-export default fileHelper;
+const authService = new AuthService();
+export default authService;
